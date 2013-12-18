@@ -1192,6 +1192,13 @@ std::string GetDalvikCacheOrDie(const char* android_data) {
 
 std::string GetDalvikCacheFilenameOrDie(const std::string& location) {
   std::string dalvik_cache(GetDalvikCacheOrDie(GetAndroidData()));
+#ifdef ALLOW_DEXROOT_ON_CACHE
+  char dexoptDataOnly[PROPERTY_VALUE_MAX];
+  property_get("dalvik.vm.dexopt-data-only", dexoptDataOnly, "1");
+  if ((StartsWith(location, "/system")) && (strcmp(dexoptDataOnly, "1") != 0)) {
+      dalvik_cache = GetDalvikCacheOrDie(GetAndroidCache());
+  }
+#endif
   if (location[0] != '/') {
     LOG(FATAL) << "Expected path in location to be absolute: "<< location;
   }
