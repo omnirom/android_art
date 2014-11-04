@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <ctime>
+
 #include "object.h"
 
 #include "art_field.h"
@@ -22,81 +24,189 @@
 #include "class.h"
 #include "class-inl.h"
 #include "class_linker-inl.h"
+#include "field_helper.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/heap.h"
 #include "iftable-inl.h"
 #include "monitor.h"
 #include "object-inl.h"
 #include "object_array-inl.h"
-#include "object_utils.h"
 #include "runtime.h"
-#include "sirt_ref.h"
+#include "handle_scope-inl.h"
 #include "throwable.h"
 #include "well_known_classes.h"
 
 namespace art {
 namespace mirror {
 
-Object* Object::Clone(Thread* self) {
-  Class* c = GetClass();
-  DCHECK(!c->IsClassClass());
+class CopyReferenceFieldsWithReadBarrierVisitor {
+ public:
+  explicit CopyReferenceFieldsWithReadBarrierVisitor(Object* dest_obj)
+      : dest_obj_(dest_obj) {}
 
-  // Object::SizeOf gets the right size even if we're an array.
-  // Using c->AllocObject() here would be wrong.
-  size_t num_bytes = SizeOf();
-  gc::Heap* heap = Runtime::Current()->GetHeap();
-  SirtRef<Object> copy(self, heap->AllocObject(self, c, num_bytes));
-  if (copy.get() == NULL) {
-    return NULL;
+  void operator()(Object* obj, MemberOffset offset, bool /* is_static */) const
+      ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    // GetFieldObject() contains a RB.
+    Object* ref = obj->GetFieldObject<Object>(offset);
+    // No WB here as a large object space does not have a card table
+    // coverage. Instead, cards will be marked separately.
+    dest_obj_->SetFieldObjectWithoutWriteBarrier<false, false>(offset, ref);
   }
 
+  void operator()(mirror::Class* klass, mirror::Reference* ref) const
+      ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    // Copy java.lang.ref.Reference.referent which isn't visited in
+    // Object::VisitReferences().
+    DCHECK(klass->IsTypeOfReferenceClass());
+    this->operator()(ref, mirror::Reference::ReferentOffset(), false);
+  }
+
+ private:
+  Object* const dest_obj_;
+};
+
+Object* Object::CopyObject(Thread* self, mirror::Object* dest, mirror::Object* src,
+                           size_t num_bytes) {
   // Copy instance data.  We assume memcpy copies by words.
   // TODO: expose and use move32.
-  byte* src_bytes = reinterpret_cast<byte*>(this);
-  byte* dst_bytes = reinterpret_cast<byte*>(copy.get());
+  byte* src_bytes = reinterpret_cast<byte*>(src);
+  byte* dst_bytes = reinterpret_cast<byte*>(dest);
   size_t offset = sizeof(Object);
   memcpy(dst_bytes + offset, src_bytes + offset, num_bytes - offset);
-
+  if (kUseBakerOrBrooksReadBarrier) {
+    // We need a RB here. After the memcpy that covers the whole
+    // object above, copy references fields one by one again with a
+    // RB. TODO: Optimize this later?
+    CopyReferenceFieldsWithReadBarrierVisitor visitor(dest);
+    src->VisitReferences<true>(visitor, visitor);
+  }
+  gc::Heap* heap = Runtime::Current()->GetHeap();
   // Perform write barriers on copied object references.
+  Class* c = src->GetClass();
   if (c->IsArrayClass()) {
     if (!c->GetComponentType()->IsPrimitive()) {
-      const ObjectArray<Object>* array = copy->AsObjectArray<Object>();
-      heap->WriteBarrierArray(copy.get(), 0, array->GetLength());
+      ObjectArray<Object>* array = dest->AsObjectArray<Object>();
+      heap->WriteBarrierArray(dest, 0, array->GetLength());
     }
   } else {
-    for (const Class* klass = c; klass != NULL; klass = klass->GetSuperClass()) {
-      size_t num_reference_fields = klass->NumReferenceInstanceFields();
-      for (size_t i = 0; i < num_reference_fields; ++i) {
-        ArtField* field = klass->GetInstanceField(i);
-        MemberOffset field_offset = field->GetOffset();
-        const Object* ref = copy->GetFieldObject<const Object*>(field_offset, false);
-        heap->WriteBarrierField(copy.get(), field_offset, ref);
+    heap->WriteBarrierEveryFieldOf(dest);
+  }
+  if (c->IsFinalizable()) {
+    heap->AddFinalizerReference(self, &dest);
+  }
+  return dest;
+}
+
+// An allocation pre-fence visitor that copies the object.
+class CopyObjectVisitor {
+ public:
+  explicit CopyObjectVisitor(Thread* self, Handle<Object>* orig, size_t num_bytes)
+      : self_(self), orig_(orig), num_bytes_(num_bytes) {
+  }
+
+  void operator()(Object* obj, size_t usable_size) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    UNUSED(usable_size);
+    Object::CopyObject(self_, obj, orig_->Get(), num_bytes_);
+  }
+
+ private:
+  Thread* const self_;
+  Handle<Object>* const orig_;
+  const size_t num_bytes_;
+  DISALLOW_COPY_AND_ASSIGN(CopyObjectVisitor);
+};
+
+Object* Object::Clone(Thread* self) {
+  CHECK(!IsClass()) << "Can't clone classes.";
+  // Object::SizeOf gets the right size even if we're an array. Using c->AllocObject() here would
+  // be wrong.
+  gc::Heap* heap = Runtime::Current()->GetHeap();
+  size_t num_bytes = SizeOf();
+  StackHandleScope<1> hs(self);
+  Handle<Object> this_object(hs.NewHandle(this));
+  Object* copy;
+  CopyObjectVisitor visitor(self, &this_object, num_bytes);
+  if (heap->IsMovableObject(this)) {
+    copy = heap->AllocObject<true>(self, GetClass(), num_bytes, visitor);
+  } else {
+    copy = heap->AllocNonMovableObject<true>(self, GetClass(), num_bytes, visitor);
+  }
+  return copy;
+}
+
+int32_t Object::GenerateIdentityHashCode() {
+  static AtomicInteger seed(987654321 + std::time(nullptr));
+  int32_t expected_value, new_value;
+  do {
+    expected_value = static_cast<uint32_t>(seed.LoadRelaxed());
+    new_value = expected_value * 1103515245 + 12345;
+  } while ((expected_value & LockWord::kHashMask) == 0 ||
+      !seed.CompareExchangeWeakRelaxed(expected_value, new_value));
+  return expected_value & LockWord::kHashMask;
+}
+
+int32_t Object::IdentityHashCode() const {
+  mirror::Object* current_this = const_cast<mirror::Object*>(this);
+  while (true) {
+    LockWord lw = current_this->GetLockWord(false);
+    switch (lw.GetState()) {
+      case LockWord::kUnlocked: {
+        // Try to compare and swap in a new hash, if we succeed we will return the hash on the next
+        // loop iteration.
+        LockWord hash_word(LockWord::FromHashCode(GenerateIdentityHashCode()));
+        DCHECK_EQ(hash_word.GetState(), LockWord::kHashCode);
+        if (const_cast<Object*>(this)->CasLockWordWeakRelaxed(lw, hash_word)) {
+          return hash_word.GetHashCode();
+        }
+        break;
+      }
+      case LockWord::kThinLocked: {
+        // Inflate the thin lock to a monitor and stick the hash code inside of the monitor. May
+        // fail spuriously.
+        Thread* self = Thread::Current();
+        StackHandleScope<1> hs(self);
+        Handle<mirror::Object> h_this(hs.NewHandle(current_this));
+        Monitor::InflateThinLocked(self, h_this, lw, GenerateIdentityHashCode());
+        // A GC may have occurred when we switched to kBlocked.
+        current_this = h_this.Get();
+        break;
+      }
+      case LockWord::kFatLocked: {
+        // Already inflated, return the has stored in the monitor.
+        Monitor* monitor = lw.FatLockMonitor();
+        DCHECK(monitor != nullptr);
+        return monitor->GetHashCode();
+      }
+      case LockWord::kHashCode: {
+        return lw.GetHashCode();
+      }
+      default: {
+        LOG(FATAL) << "Invalid state during hashcode " << lw.GetState();
+        break;
       }
     }
   }
-
-  if (c->IsFinalizable()) {
-    heap->AddFinalizerReference(Thread::Current(), copy.get());
-  }
-
-  return copy.get();
+  LOG(FATAL) << "Unreachable";
+  return 0;
 }
 
-void Object::CheckFieldAssignmentImpl(MemberOffset field_offset, const Object* new_value) {
-  const Class* c = GetClass();
-  if (Runtime::Current()->GetClassLinker() == NULL ||
-      !Runtime::Current()->GetHeap()->IsObjectValidationEnabled() ||
-      !c->IsResolved()) {
+void Object::CheckFieldAssignmentImpl(MemberOffset field_offset, Object* new_value) {
+  Class* c = GetClass();
+  Runtime* runtime = Runtime::Current();
+  if (runtime->GetClassLinker() == nullptr || !runtime->IsStarted() ||
+      !runtime->GetHeap()->IsObjectValidationEnabled() || !c->IsResolved()) {
     return;
   }
-  for (const Class* cur = c; cur != NULL; cur = cur->GetSuperClass()) {
+  for (Class* cur = c; cur != NULL; cur = cur->GetSuperClass()) {
     ObjectArray<ArtField>* fields = cur->GetIFields();
     if (fields != NULL) {
       size_t num_ref_ifields = cur->NumReferenceInstanceFields();
       for (size_t i = 0; i < num_ref_ifields; ++i) {
         ArtField* field = fields->Get(i);
         if (field->GetOffset().Int32Value() == field_offset.Int32Value()) {
-          FieldHelper fh(field);
+          StackHandleScope<1> hs(Thread::Current());
+          FieldHelper fh(hs.NewHandle(field));
           CHECK(fh.GetType()->IsAssignableFrom(new_value->GetClass()));
           return;
         }
@@ -114,7 +224,8 @@ void Object::CheckFieldAssignmentImpl(MemberOffset field_offset, const Object* n
       for (size_t i = 0; i < num_ref_sfields; ++i) {
         ArtField* field = fields->Get(i);
         if (field->GetOffset().Int32Value() == field_offset.Int32Value()) {
-          FieldHelper fh(field);
+          StackHandleScope<1> hs(Thread::Current());
+          FieldHelper fh(hs.NewHandle(field));
           CHECK(fh.GetType()->IsAssignableFrom(new_value->GetClass()));
           return;
         }
