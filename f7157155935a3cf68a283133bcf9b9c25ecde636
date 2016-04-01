@@ -1,0 +1,38 @@
+{
+  "comments": [
+    {
+      "key": {
+        "uuid": "98faad2e_93121d0a",
+        "filename": "build/Android.common_build.mk",
+        "patchSetId": 1
+      },
+      "lineNbr": 74,
+      "author": {
+        "id": 1000515
+      },
+      "writtenOn": "2016-04-01T20:39:28Z",
+      "side": 1,
+      "message": "should not be default \"true\" here?",
+      "revId": "f7157155935a3cf68a283133bcf9b9c25ecde636",
+      "serverId": "56841c99-7c94-43d4-bf0b-cb4707e66d55",
+      "unresolved": false
+    },
+    {
+      "key": {
+        "uuid": "98faad2e_73f791cf",
+        "filename": "build/Android.common_build.mk",
+        "patchSetId": 1
+      },
+      "lineNbr": 77,
+      "author": {
+        "id": 1000515
+      },
+      "writtenOn": "2016-04-01T20:39:28Z",
+      "side": 1,
+      "message": "and \"false\" here ?",
+      "revId": "f7157155935a3cf68a283133bcf9b9c25ecde636",
+      "serverId": "56841c99-7c94-43d4-bf0b-cb4707e66d55",
+      "unresolved": false
+    }
+  ]
+}
