@@ -30,10 +30,10 @@
 // Includes for the types that are being specialized
 #include <string>
 #include "base/time_utils.h"
+#include "base/logging.h"
 #include "experimental_flags.h"
 #include "gc/collector_type.h"
 #include "gc/space/large_object_space.h"
-#include "jdwp/jdwp.h"
 #include "jdwp_provider.h"
 #include "jit/profile_saver_options.h"
 #include "plugin.h"
@@ -74,13 +74,10 @@ struct CmdlineType<JdwpProvider> : CmdlineTypeParser<JdwpProvider> {
     if (option == "help") {
       return Result::Usage(
           "Example: -XjdwpProvider:none to disable JDWP\n"
-          "Example: -XjdwpProvider:internal for internal jdwp implementation\n"
           "Example: -XjdwpProvider:adbconnection for adb connection mediated jdwp implementation\n"
           "Example: -XjdwpProvider:default for the default jdwp implementation\n");
     } else if (option == "default") {
       return Result::Success(JdwpProvider::kDefaultJdwpProvider);
-    } else if (option == "internal") {
-      return Result::Success(JdwpProvider::kInternal);
     } else if (option == "adbconnection") {
       return Result::Success(JdwpProvider::kAdbConnection);
     } else if (option == "none") {
@@ -445,8 +442,6 @@ static gc::CollectorType ParseCollectorType(const std::string& option) {
     return gc::kCollectorTypeCMS;
   } else if (option == "SS") {
     return gc::kCollectorTypeSS;
-  } else if (option == "GSS") {
-    return gc::kCollectorTypeGSS;
   } else if (option == "CC") {
     return gc::kCollectorTypeCC;
   } else {
@@ -600,6 +595,8 @@ struct CmdlineType<LogVerbosity> : CmdlineTypeParser<LogVerbosity> {
         log_verbosity.gc = true;
       } else if (verbose_options[j] == "heap") {
         log_verbosity.heap = true;
+      } else if (verbose_options[j] == "interpreter") {
+        log_verbosity.interpreter = true;
       } else if (verbose_options[j] == "jdwp") {
         log_verbosity.jdwp = true;
       } else if (verbose_options[j] == "jit") {
@@ -630,6 +627,8 @@ struct CmdlineType<LogVerbosity> : CmdlineTypeParser<LogVerbosity> {
         log_verbosity.image = true;
       } else if (verbose_options[j] == "systrace-locks") {
         log_verbosity.systrace_lock_logging = true;
+      } else if (verbose_options[j] == "plugin") {
+        log_verbosity.plugin = true;
       } else if (verbose_options[j] == "agents") {
         log_verbosity.agents = true;
       } else if (verbose_options[j] == "dex") {
